@@ -11,8 +11,6 @@ import path from "path";
 // ─── Configuration ───────────────────────────────────────────────────────────
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || "";
-const META_AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID || ""; // format: act_XXXXXXXXX
-const META_APP_ID = process.env.META_APP_ID || "";
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const PORT = parseInt(process.env.PORT || "3000", 10);
@@ -63,6 +61,17 @@ function validateVideoMime(mimeType: string, fileName: string): void {
 }
 
 // ─── Meta API Functions ──────────────────────────────────────────────────────
+
+async function fetchAdAccounts(): Promise<Array<{ id: string; name: string; account_status: number; currency: string }>> {
+  const response = await axios.get(`${GRAPH_API_BASE}/me/adaccounts`, {
+    params: {
+      fields: "id,name,account_status,currency,business_name",
+      limit: 100,
+      access_token: META_ACCESS_TOKEN,
+    },
+  });
+  return response.data.data;
+}
 
 async function uploadAdImageFromUrl(
   imageUrl: string,
@@ -272,30 +281,80 @@ function createMcpServer(): McpServer {
     version: "1.0.0",
   });
 
+  // Tool: List Ad Accounts
+  server.tool(
+    "list_ad_accounts",
+    "List all Meta Ad Accounts accessible with the configured access token. Use this first to find the correct ad_account_id before uploading media.",
+    {},
+    async () => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const accounts = await fetchAdAccounts();
+
+        const statusMap: Record<number, string> = {
+          1: "ACTIVE",
+          2: "DISABLED",
+          3: "UNSETTLED",
+          7: "PENDING_RISK_REVIEW",
+          8: "PENDING_SETTLEMENT",
+          9: "IN_GRACE_PERIOD",
+          100: "PENDING_CLOSURE",
+          101: "CLOSED",
+          201: "ANY_ACTIVE",
+          202: "ANY_CLOSED",
+        };
+
+        const formatted = accounts.map((a: any) => ({
+          id: a.id,
+          name: a.name || "Unnamed",
+          status: statusMap[a.account_status] || `UNKNOWN (${a.account_status})`,
+          currency: a.currency || "N/A",
+          business_name: a.business_name || "N/A",
+        }));
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ad_accounts: formatted,
+              count: formatted.length,
+              message: "Use the 'id' field (e.g., act_XXXXXXXXX) as the ad_account_id parameter in other tools.",
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
   // Tool: Upload Image from URL
   server.tool(
     "upload_ad_image",
-    "Upload an image to Meta Ads Library from a public URL. Returns the image hash needed for creating ad creatives. Supports jpg, png, gif, bmp, tiff, webp.",
+    "Upload an image to Meta Ads Library from a public URL. Returns the image hash needed for creating ad creatives. Supports jpg, png, gif, bmp, tiff, webp. You MUST provide an ad_account_id — use list_ad_accounts first to find it.",
     {
       image_url: z
         .string()
         .describe("Public URL of the image to upload to Meta Ads"),
       ad_account_id: z
         .string()
-        .optional()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Uses server default if not provided."),
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
     },
     async ({ image_url, ad_account_id }) => {
       try {
-        const accountId = ad_account_id || META_AD_ACCOUNT_ID;
-        if (!accountId) {
-          return { content: [{ type: "text" as const, text: "Error: No ad account ID configured. Set META_AD_ACCOUNT_ID on the server or pass ad_account_id." }] };
-        }
         if (!META_ACCESS_TOKEN) {
           return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
         }
+        if (!ad_account_id) {
+          return { content: [{ type: "text" as const, text: "Error: ad_account_id is required. Use list_ad_accounts to find available accounts." }] };
+        }
 
-        const result = await uploadAdImageFromUrl(image_url, accountId);
+        const result = await uploadAdImageFromUrl(image_url, ad_account_id);
 
         return {
           content: [{
@@ -305,6 +364,7 @@ function createMcpServer(): McpServer {
               image_hash: result.hash,
               image_url: result.url,
               file_name: result.name,
+              ad_account_id,
               message: `Image uploaded successfully. Use image_hash "${result.hash}" when creating ad creatives.`,
             }, null, 2),
           }],
@@ -319,11 +379,14 @@ function createMcpServer(): McpServer {
   // Tool: Upload Video from URL
   server.tool(
     "upload_ad_video",
-    "Upload a video to Meta Ads Library from a public URL. Supports files up to 4GB with automatic chunked upload. Returns the video ID needed for creating ad creatives.",
+    "Upload a video to Meta Ads Library from a public URL. Supports files up to 4GB with automatic chunked upload. Returns the video ID needed for creating ad creatives. You MUST provide an ad_account_id — use list_ad_accounts first to find it.",
     {
       video_url: z
         .string()
         .describe("Public URL of the video file to upload (mp4, mov, avi, mkv, webm)"),
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
       title: z
         .string()
         .optional()
@@ -332,22 +395,17 @@ function createMcpServer(): McpServer {
         .string()
         .optional()
         .describe("Description for the video"),
-      ad_account_id: z
-        .string()
-        .optional()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Uses server default if not provided."),
     },
-    async ({ video_url, title, description, ad_account_id }) => {
+    async ({ video_url, ad_account_id, title, description }) => {
       try {
-        const accountId = ad_account_id || META_AD_ACCOUNT_ID;
-        if (!accountId) {
-          return { content: [{ type: "text" as const, text: "Error: No ad account ID configured. Set META_AD_ACCOUNT_ID on the server or pass ad_account_id." }] };
-        }
         if (!META_ACCESS_TOKEN) {
           return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
         }
+        if (!ad_account_id) {
+          return { content: [{ type: "text" as const, text: "Error: ad_account_id is required. Use list_ad_accounts to find available accounts." }] };
+        }
 
-        const result = await uploadAdVideoFromUrl(video_url, accountId, title, description);
+        const result = await uploadAdVideoFromUrl(video_url, ad_account_id, title, description);
 
         return {
           content: [{
@@ -357,6 +415,7 @@ function createMcpServer(): McpServer {
               video_id: result.videoId,
               title: result.title,
               upload_status: result.uploadStatus,
+              ad_account_id,
               message: `Video uploaded successfully. Video ID: "${result.videoId}". Video is processing — use check_video_status to verify it's ready before creating ad creatives.`,
             }, null, 2),
           }],
@@ -412,12 +471,11 @@ function createMcpServer(): McpServer {
   // Tool: List Ad Images
   server.tool(
     "list_ad_images",
-    "List existing images in the Meta Ad Account's image library. Useful for checking what's already uploaded or finding image hashes.",
+    "List existing images in a Meta Ad Account's image library. Useful for checking what's already uploaded or finding image hashes.",
     {
       ad_account_id: z
         .string()
-        .optional()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Uses server default if not provided."),
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
       limit: z
         .number()
         .optional()
@@ -425,12 +483,11 @@ function createMcpServer(): McpServer {
     },
     async ({ ad_account_id, limit }) => {
       try {
-        const accountId = ad_account_id || META_AD_ACCOUNT_ID;
-        if (!accountId || !META_ACCESS_TOKEN) {
+        if (!ad_account_id || !META_ACCESS_TOKEN) {
           return { content: [{ type: "text" as const, text: "Error: Missing ad account ID or access token." }] };
         }
 
-        const images = await listAdImages(accountId, limit || 25);
+        const images = await listAdImages(ad_account_id, limit || 25);
 
         return {
           content: [{
