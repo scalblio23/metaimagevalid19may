@@ -282,6 +282,95 @@ async function listAdImages(adAccountId: string, limit: number = 25) {
   return response.data.data;
 }
 
+// ─── Meta Campaign/Ad Management Functions ─────────────────────────────────
+
+async function listCampaigns(adAccountId: string, limit: number = 25) {
+  const response = await axios.get(`${GRAPH_API_BASE}/${adAccountId}/campaigns`, {
+    params: {
+      fields: "id,name,status,objective,daily_budget,lifetime_budget,start_time,stop_time,created_time",
+      limit,
+      access_token: META_ACCESS_TOKEN,
+    },
+  });
+  return response.data.data;
+}
+
+async function listAdSets(adAccountId: string, campaignId?: string, limit: number = 25) {
+  const endpoint = campaignId
+    ? `${GRAPH_API_BASE}/${campaignId}/adsets`
+    : `${GRAPH_API_BASE}/${adAccountId}/adsets`;
+
+  const response = await axios.get(endpoint, {
+    params: {
+      fields: "id,name,status,campaign_id,daily_budget,lifetime_budget,targeting,optimization_goal,billing_event,start_time,end_time",
+      limit,
+      access_token: META_ACCESS_TOKEN,
+    },
+  });
+  return response.data.data;
+}
+
+async function listAds(adAccountId: string, adSetId?: string, limit: number = 25) {
+  const endpoint = adSetId
+    ? `${GRAPH_API_BASE}/${adSetId}/ads`
+    : `${GRAPH_API_BASE}/${adAccountId}/ads`;
+
+  const response = await axios.get(endpoint, {
+    params: {
+      fields: "id,name,status,adset_id,creative{id,name,title,body,image_hash,image_url,thumbnail_url,object_story_spec}",
+      limit,
+      access_token: META_ACCESS_TOKEN,
+    },
+  });
+  return response.data.data;
+}
+
+async function createAdCreative(
+  adAccountId: string,
+  name: string,
+  objectStorySpec: any
+): Promise<{ id: string; name: string }> {
+  const response = await axios.post(
+    `${GRAPH_API_BASE}/${adAccountId}/adcreatives`,
+    {
+      name,
+      object_story_spec: objectStorySpec,
+      access_token: META_ACCESS_TOKEN,
+    }
+  );
+  return { id: response.data.id, name };
+}
+
+async function createAd(
+  adAccountId: string,
+  name: string,
+  adSetId: string,
+  creativeId: string,
+  status: string = "PAUSED"
+): Promise<{ id: string; name: string }> {
+  const response = await axios.post(
+    `${GRAPH_API_BASE}/${adAccountId}/ads`,
+    {
+      name,
+      adset_id: adSetId,
+      creative: { creative_id: creativeId },
+      status,
+      access_token: META_ACCESS_TOKEN,
+    }
+  );
+  return { id: response.data.id, name };
+}
+
+async function getAdCreativeDetails(creativeId: string) {
+  const response = await axios.get(`${GRAPH_API_BASE}/${creativeId}`, {
+    params: {
+      fields: "id,name,title,body,image_hash,image_url,object_story_spec,url_tags,asset_feed_spec",
+      access_token: META_ACCESS_TOKEN,
+    },
+  });
+  return response.data;
+}
+
 // ─── MCP Server Setup ────────────────────────────────────────────────────────
 
 function createMcpServer(): McpServer {
@@ -620,6 +709,243 @@ function createMcpServer(): McpServer {
           content: [{
             type: "text" as const,
             text: JSON.stringify({ success: true, images, count: images.length }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: List Campaigns
+  server.tool(
+    "list_campaigns",
+    "List campaigns in a Meta Ad Account. Returns campaign IDs, names, status, objectives, and budgets. Use this to find the campaign you want to add ads to.",
+    {
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
+      limit: z
+        .number()
+        .optional()
+        .describe("Number of campaigns to return (default: 25)"),
+    },
+    async ({ ad_account_id, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const campaigns = await listCampaigns(ad_account_id, limit || 25);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, campaigns, count: campaigns.length }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: List Ad Sets
+  server.tool(
+    "list_adsets",
+    "List ad sets in a Meta Ad Account or within a specific campaign. Returns ad set IDs, names, status, targeting, and budgets.",
+    {
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      campaign_id: z
+        .string()
+        .optional()
+        .describe("Optional: filter ad sets by campaign ID. If not provided, lists all ad sets in the account."),
+      limit: z
+        .number()
+        .optional()
+        .describe("Number of ad sets to return (default: 25)"),
+    },
+    async ({ ad_account_id, campaign_id, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const adsets = await listAdSets(ad_account_id, campaign_id, limit || 25);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, adsets, count: adsets.length }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: List Ads
+  server.tool(
+    "list_ads",
+    "List ads in a Meta Ad Account or within a specific ad set. Returns ad IDs, names, status, and creative details. Useful for finding existing ads to duplicate or reference their copy.",
+    {
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      adset_id: z
+        .string()
+        .optional()
+        .describe("Optional: filter ads by ad set ID. If not provided, lists all ads in the account."),
+      limit: z
+        .number()
+        .optional()
+        .describe("Number of ads to return (default: 25)"),
+    },
+    async ({ ad_account_id, adset_id, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const ads = await listAds(ad_account_id, adset_id, limit || 25);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, ads, count: ads.length }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Get Ad Creative Details
+  server.tool(
+    "get_ad_creative",
+    "Get full details of an ad creative by ID. Returns the object_story_spec, image hash, copy text, and all other creative fields. Use this to inspect an existing ad's creative before duplicating it with a new image.",
+    {
+      creative_id: z
+        .string()
+        .describe("The creative ID to look up (from list_ads results)."),
+    },
+    async ({ creative_id }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const creative = await getAdCreativeDetails(creative_id);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({ success: true, creative }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Create Ad Creative
+  server.tool(
+    "create_ad_creative",
+    "Create a new ad creative in Meta Ads. Requires an object_story_spec which defines the Facebook Page post (image, text, link, etc). Use get_ad_creative on an existing ad to see the format, then modify it with your new image_hash.",
+    {
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      name: z
+        .string()
+        .describe("Name for the creative (internal label, not shown to users)."),
+      object_story_spec: z
+        .string()
+        .describe('JSON string of the object_story_spec. Must include page_id and the creative content (link_data with image_hash, message, link, call_to_action, etc). Example: {\"page_id\":\"123\",\"link_data\":{\"image_hash\":\"abc123\",\"link\":\"https://example.com\",\"message\":\"Ad text here\"}}'),
+    },
+    async ({ ad_account_id, name, object_story_spec }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        let parsedSpec: any;
+        try {
+          parsedSpec = JSON.parse(object_story_spec);
+        } catch (e) {
+          return { content: [{ type: "text" as const, text: "Error: object_story_spec must be valid JSON." }] };
+        }
+
+        const result = await createAdCreative(ad_account_id, name, parsedSpec);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              creative_id: result.id,
+              name: result.name,
+              message: `Ad creative created successfully. Creative ID: "${result.id}". Use this ID with create_ad to attach it to an ad set.`,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Create Ad
+  server.tool(
+    "create_ad",
+    "Create a new ad within an ad set. Links a creative to an ad set so it starts delivering (or is paused). This is the final step to get an ad live.",
+    {
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      name: z
+        .string()
+        .describe("Name for the ad (internal label)."),
+      adset_id: z
+        .string()
+        .describe("The ad set ID to place this ad in."),
+      creative_id: z
+        .string()
+        .describe("The creative ID to use (from create_ad_creative)."),
+      status: z
+        .string()
+        .optional()
+        .describe("Ad status: ACTIVE or PAUSED (default: PAUSED). Set to ACTIVE to start delivering immediately."),
+    },
+    async ({ ad_account_id, name, adset_id, creative_id, status }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const result = await createAd(ad_account_id, name, adset_id, creative_id, status || "PAUSED");
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              ad_id: result.id,
+              name: result.name,
+              status: status || "PAUSED",
+              message: `Ad created successfully. Ad ID: "${result.id}". ${status === "ACTIVE" ? "Ad is now delivering." : "Ad is paused — set status to ACTIVE when ready to launch."}`,
+            }, null, 2),
           }],
         };
       } catch (error: any) {
