@@ -7,6 +7,8 @@ import express from "express";
 import cors from "cors";
 import { Readable } from "stream";
 import path from "path";
+import multer from "multer";
+import crypto from "crypto";
 import type { Request, Response } from "express";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -16,33 +18,34 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
-// ─── Chunked Upload Session Storage ────────────────────────────────────────
+// ─── Direct Upload Session Storage ────────────────────────────────────────
 
-interface UploadSession {
+interface DirectUploadSession {
   id: string;
-  fileName: string;
-  mimeType: string;
   adAccountId: string;
   mediaType: "image" | "video";
-  chunks: string[];
-  totalChunks: number;
-  receivedChunks: number;
-  createdAt: number;
   title?: string;
   description?: string;
+  createdAt: number;
+  status: "pending" | "uploading" | "complete" | "error";
+  result?: any;
+  error?: string;
 }
 
-const uploadSessions = new Map<string, UploadSession>();
+const directUploadSessions = new Map<string, DirectUploadSession>();
 
-// Clean up sessions older than 10 minutes
+// Clean up sessions older than 30 minutes
 setInterval(() => {
   const now = Date.now();
-  for (const [id, session] of uploadSessions) {
-    if (now - session.createdAt > 10 * 60 * 1000) {
-      uploadSessions.delete(id);
+  for (const [id, session] of directUploadSessions) {
+    if (now - session.createdAt > 30 * 60 * 1000) {
+      directUploadSessions.delete(id);
     }
   }
 }, 60000);
+
+// Multer for handling file uploads
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
@@ -459,124 +462,6 @@ function createMcpServer(): McpServer {
     }
   );
 
-  // Tool: Upload Image from base64
-  server.tool(
-    "upload_ad_image_base64",
-    "Upload an image to Meta Ads Library from base64-encoded data. Use this when you have the image content directly (e.g., from a file the user shared in chat). Send the FULL base64 string in one call — do NOT chunk it.",
-    {
-      base64_data: z
-        .string()
-        .describe("The complete base64-encoded image data (without the data:image/... prefix). Send it all in one string."),
-      file_name: z
-        .string()
-        .describe("File name with extension (e.g., 'ad-creative.png', 'hero-image.jpg')"),
-      ad_account_id: z
-        .string()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
-    },
-    async ({ base64_data, file_name, ad_account_id }) => {
-      try {
-        if (!META_ACCESS_TOKEN) {
-          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
-        }
-        if (!ad_account_id) {
-          return { content: [{ type: "text" as const, text: "Error: ad_account_id is required. Use list_ad_accounts to find available accounts." }] };
-        }
-
-        const cleanBase64 = base64_data.replace(/^data:[^;]+;base64,/, "");
-        const buffer = Buffer.from(cleanBase64, "base64");
-
-        if (buffer.length > 30 * 1024 * 1024) {
-          return { content: [{ type: "text" as const, text: `Error: Image size ${(buffer.length / 1024 / 1024).toFixed(1)}MB exceeds Meta's 30MB limit.` }] };
-        }
-
-        const mimeType = mimeFromExtension(file_name);
-        const result = await uploadImageBuffer(buffer, file_name, mimeType, ad_account_id);
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: true,
-              image_hash: result.hash,
-              image_url: result.url,
-              file_name: result.name,
-              file_size_mb: (buffer.length / 1024 / 1024).toFixed(2),
-              ad_account_id,
-              message: `Image uploaded successfully. Use image_hash "${result.hash}" when creating ad creatives.`,
-            }, null, 2),
-          }],
-        };
-      } catch (error: any) {
-        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
-      }
-    }
-  );
-
-  // Tool: Upload Video from base64
-  server.tool(
-    "upload_ad_video_base64",
-    "Upload a video to Meta Ads Library from base64-encoded data. Use this when you have the video content directly. Send the FULL base64 string in one call — do NOT chunk it.",
-    {
-      base64_data: z
-        .string()
-        .describe("The complete base64-encoded video data (without the data:video/... prefix). Send it all in one string."),
-      file_name: z
-        .string()
-        .describe("File name with extension (e.g., 'ad-video.mp4', 'promo.mov')"),
-      ad_account_id: z
-        .string()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
-      title: z
-        .string()
-        .optional()
-        .describe("Title for the video in Meta Ads Library"),
-      description: z
-        .string()
-        .optional()
-        .describe("Description for the video"),
-    },
-    async ({ base64_data, file_name, ad_account_id, title, description }) => {
-      try {
-        if (!META_ACCESS_TOKEN) {
-          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
-        }
-        if (!ad_account_id) {
-          return { content: [{ type: "text" as const, text: "Error: ad_account_id is required. Use list_ad_accounts to find available accounts." }] };
-        }
-
-        const cleanBase64 = base64_data.replace(/^data:[^;]+;base64,/, "");
-        const buffer = Buffer.from(cleanBase64, "base64");
-
-        if (buffer.length > 4 * 1024 * 1024 * 1024) {
-          return { content: [{ type: "text" as const, text: "Error: Video size exceeds Meta's 4GB limit." }] };
-        }
-
-        const mimeType = mimeFromExtension(file_name);
-        const result = await uploadVideoBuffer(buffer, file_name, mimeType, ad_account_id, title, description);
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: true,
-              video_id: result.videoId,
-              title: result.title,
-              upload_status: result.uploadStatus,
-              file_size_mb: (buffer.length / 1024 / 1024).toFixed(2),
-              ad_account_id,
-              message: `Video uploaded successfully. Video ID: "${result.videoId}". Video is processing — use check_video_status to verify it's ready.`,
-            }, null, 2),
-          }],
-        };
-      } catch (error: any) {
-        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
-      }
-    }
-  );
-
   // Tool: Upload Image from URL
   server.tool(
     "upload_ad_image_url",
@@ -983,20 +868,14 @@ function createMcpServer(): McpServer {
     }
   );
 
-  // Tool: Start Chunked Upload
+  // Tool: Get Upload URL
   server.tool(
-    "start_upload",
-    "Start a chunked file upload session. Use this when you have a large image or video to upload. Call this first, then send chunks via upload_chunk, then call finish_upload to push to Meta. Each chunk should be ~50KB of base64 (about 37KB decoded). This avoids timeout issues with large files.",
+    "get_upload_url",
+    "Get a one-time upload URL for directly uploading an image or video file to the server. PREFERRED METHOD: After getting the URL, use your sandbox shell to run: curl -F 'file=@/path/to/file.png' <upload_url>. This is MUCH faster than base64 encoding. Then call get_upload_result to get the Meta image hash or video ID.",
     {
-      file_name: z
-        .string()
-        .describe("File name with extension (e.g., 'ad-creative.png', 'hero-video.mp4')"),
       ad_account_id: z
         .string()
-        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
-      total_chunks: z
-        .number()
-        .describe("Total number of chunks you will send. Calculate: Math.ceil(base64_string_length / 50000)"),
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX). Use list_ad_accounts to find available accounts."),
       media_type: z
         .enum(["image", "video"])
         .describe("Whether this is an image or video upload."),
@@ -1009,30 +888,31 @@ function createMcpServer(): McpServer {
         .optional()
         .describe("Description for videos (optional, ignored for images)."),
     },
-    async ({ file_name, ad_account_id, total_chunks, media_type, title, description }) => {
+    async ({ ad_account_id, media_type, title, description }) => {
       try {
         if (!META_ACCESS_TOKEN) {
           return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
         }
 
-        const sessionId = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const mimeType = mimeFromExtension(file_name);
+        const sessionId = crypto.randomUUID();
 
-        const session: UploadSession = {
+        const session: DirectUploadSession = {
           id: sessionId,
-          fileName: file_name,
-          mimeType,
           adAccountId: ad_account_id,
           mediaType: media_type,
-          chunks: new Array(total_chunks).fill(""),
-          totalChunks: total_chunks,
-          receivedChunks: 0,
-          createdAt: Date.now(),
           title,
           description,
+          createdAt: Date.now(),
+          status: "pending",
         };
 
-        uploadSessions.set(sessionId, session);
+        directUploadSessions.set(sessionId, session);
+
+        const serverUrl = process.env.RAILWAY_PUBLIC_DOMAIN
+          ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
+          : `http://localhost:${PORT}`;
+
+        const uploadUrl = `${serverUrl}/upload/${sessionId}`;
 
         return {
           content: [{
@@ -1040,9 +920,9 @@ function createMcpServer(): McpServer {
             text: JSON.stringify({
               success: true,
               session_id: sessionId,
-              total_chunks,
-              chunk_size_guideline: "Send ~50000 characters of base64 per chunk",
-              message: `Upload session started. Now call upload_chunk ${total_chunks} times with chunk_index 0 through ${total_chunks - 1}, then call finish_upload.`,
+              upload_url: uploadUrl,
+              instructions: `Upload the file using your shell: curl -F "file=@/path/to/your/file" ${uploadUrl}`,
+              next_step: "After the curl command succeeds, call get_upload_result with this session_id to get the Meta image hash or video ID.",
             }, null, 2),
           }],
         };
@@ -1052,122 +932,46 @@ function createMcpServer(): McpServer {
     }
   );
 
-  // Tool: Upload Chunk
+  // Tool: Get Upload Result
   server.tool(
-    "upload_chunk",
-    "Send one chunk of base64 data for a chunked upload session. Each chunk should be approximately 50000 characters of base64. Call this repeatedly for each chunk until all chunks are sent.",
+    "get_upload_result",
+    "Check the result of a file upload that was initiated via get_upload_url. Returns the Meta image hash or video ID once the upload and transfer to Meta is complete.",
     {
       session_id: z
         .string()
-        .describe("The session ID returned from start_upload."),
-      chunk_index: z
-        .number()
-        .describe("Zero-based index of this chunk (0, 1, 2, ...)."),
-      data: z
-        .string()
-        .describe("A portion of the base64-encoded file data (~50000 characters). Do NOT include data:image/... prefix."),
-    },
-    async ({ session_id, chunk_index, data }) => {
-      try {
-        const session = uploadSessions.get(session_id);
-        if (!session) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Session not found or expired. Start a new upload with start_upload." }, null, 2) }] };
-        }
-
-        if (chunk_index < 0 || chunk_index >= session.totalChunks) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: `Invalid chunk_index. Must be 0 to ${session.totalChunks - 1}.` }, null, 2) }] };
-        }
-
-        session.chunks[chunk_index] = data;
-        session.receivedChunks++;
-
-        const remaining = session.totalChunks - session.receivedChunks;
-
-        return {
-          content: [{
-            type: "text" as const,
-            text: JSON.stringify({
-              success: true,
-              session_id,
-              chunk_index,
-              chunks_received: session.receivedChunks,
-              chunks_remaining: remaining,
-              message: remaining === 0
-                ? "All chunks received! Call finish_upload to complete the upload to Meta."
-                : `Chunk ${chunk_index} received. ${remaining} chunks remaining.`,
-            }, null, 2),
-          }],
-        };
-      } catch (error: any) {
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: error.message }, null, 2) }] };
-      }
-    }
-  );
-
-  // Tool: Finish Upload
-  server.tool(
-    "finish_upload",
-    "Complete a chunked upload session. Assembles all chunks, decodes the base64, and uploads the file to Meta Ads Library. Call this after all chunks have been sent via upload_chunk.",
-    {
-      session_id: z
-        .string()
-        .describe("The session ID returned from start_upload."),
+        .describe("The session_id returned from get_upload_url."),
     },
     async ({ session_id }) => {
       try {
-        const session = uploadSessions.get(session_id);
+        const session = directUploadSessions.get(session_id);
         if (!session) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Session not found or expired." }, null, 2) }] };
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Session not found or expired. Get a new upload URL with get_upload_url." }, null, 2) }] };
         }
 
-        // Check all chunks received
-        const missingChunks = session.chunks.map((c, i) => c === "" ? i : -1).filter(i => i >= 0);
-        if (missingChunks.length > 0) {
-          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: `Missing chunks: ${missingChunks.join(", ")}. Send them via upload_chunk before finishing.` }, null, 2) }] };
+        if (session.status === "pending") {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, status: "pending", message: "No file has been uploaded yet. Use curl to upload the file to the upload_url first." }, null, 2) }] };
         }
 
-        // Assemble and decode
-        const fullBase64 = session.chunks.join("");
-        const buffer = Buffer.from(fullBase64, "base64");
-
-        let result: any;
-
-        if (session.mediaType === "image") {
-          const uploadResult = await uploadImageBuffer(buffer, session.fileName, session.mimeType, session.adAccountId);
-          result = {
-            success: true,
-            type: "image",
-            image_hash: uploadResult.hash,
-            image_url: uploadResult.url,
-            file_name: uploadResult.name,
-            ad_account_id: session.adAccountId,
-            message: `Image uploaded successfully! Image hash: "${uploadResult.hash}". Use this hash with create_ad_creative.`,
-          };
-        } else {
-          const uploadResult = await uploadVideoBuffer(buffer, session.fileName, session.mimeType, session.adAccountId, session.title, session.description);
-          result = {
-            success: true,
-            type: "video",
-            video_id: uploadResult.videoId,
-            title: uploadResult.title,
-            upload_status: uploadResult.uploadStatus,
-            ad_account_id: session.adAccountId,
-            message: `Video uploaded successfully! Video ID: "${uploadResult.videoId}". Use check_video_status to verify processing is complete.`,
-          };
+        if (session.status === "uploading") {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, status: "uploading", message: "File is still being processed and uploaded to Meta. Try again in a few seconds." }, null, 2) }] };
         }
 
-        // Clean up session
-        uploadSessions.delete(session_id);
+        if (session.status === "error") {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, status: "error", error: session.error }, null, 2) }] };
+        }
+
+        // Complete
+        const result = session.result;
+        directUploadSessions.delete(session_id);
 
         return {
           content: [{
             type: "text" as const,
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify({ success: true, status: "complete", ...result }, null, 2),
           }],
         };
       } catch (error: any) {
-        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
-        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: error.message }, null, 2) }] };
       }
     }
   );
@@ -1238,6 +1042,68 @@ app.get("/sse", (_req, res) => {
     endpoint: "/mcp",
     transport: "streamable-http",
   });
+});
+
+// ─── Direct Upload Endpoint ─────────────────────────────────────────────────
+// Claude calls get_upload_url → gets a one-time URL → uses curl to POST file here → calls get_upload_result
+app.post("/upload/:sessionId", upload.single("file"), async (req: Request, res: Response) => {
+  const sessionId = req.params.sessionId as string;
+  const session = directUploadSessions.get(sessionId);
+
+  if (!session) {
+    res.status(404).json({ success: false, error: "Upload session not found or expired." });
+    return;
+  }
+
+  if (session.status !== "pending") {
+    res.status(400).json({ success: false, error: `Session already used (status: ${session.status}).` });
+    return;
+  }
+
+  if (!req.file) {
+    res.status(400).json({ success: false, error: 'No file uploaded. Use: curl -F "file=@/path/to/file" <upload_url>' });
+    return;
+  }
+
+  session.status = "uploading";
+
+  try {
+    const buffer = req.file.buffer;
+    const fileName = req.file.originalname || "upload";
+    const mimeType = req.file.mimetype || mimeFromExtension(fileName);
+
+    if (session.mediaType === "image") {
+      const result = await uploadImageBuffer(buffer, fileName, mimeType, session.adAccountId);
+      session.result = {
+        type: "image",
+        image_hash: result.hash,
+        image_url: result.url,
+        file_name: result.name,
+        file_size_mb: (buffer.length / 1024 / 1024).toFixed(2),
+        ad_account_id: session.adAccountId,
+        message: `Image uploaded successfully. Image hash: "${result.hash}". Use this with create_ad_creative.`,
+      };
+    } else {
+      const result = await uploadVideoBuffer(buffer, fileName, mimeType, session.adAccountId, session.title, session.description);
+      session.result = {
+        type: "video",
+        video_id: result.videoId,
+        title: result.title,
+        upload_status: result.uploadStatus,
+        file_size_mb: (buffer.length / 1024 / 1024).toFixed(2),
+        ad_account_id: session.adAccountId,
+        message: `Video uploaded successfully. Video ID: "${result.videoId}". Use check_video_status to verify processing.`,
+      };
+    }
+
+    session.status = "complete";
+    res.json({ success: true, message: "File received and uploaded to Meta. Call get_upload_result to get the details." });
+  } catch (error: any) {
+    const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+    session.status = "error";
+    session.error = errorMsg;
+    res.status(500).json({ success: false, error: errorMsg });
+  }
 });
 
 // Start the server
