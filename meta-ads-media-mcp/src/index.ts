@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import axios from "axios";
 import FormData from "form-data";
@@ -7,6 +7,7 @@ import express from "express";
 import cors from "cors";
 import { Readable } from "stream";
 import path from "path";
+import type { Request, Response } from "express";
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -14,7 +15,6 @@ const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN || "";
 const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const PORT = parseInt(process.env.PORT || "3000", 10);
-const AUTH_TOKEN = process.env.AUTH_TOKEN || ""; // Optional: secure your MCP endpoint
 
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
@@ -106,7 +106,6 @@ async function uploadAdImageFromUrl(
   imageUrl: string,
   adAccountId: string
 ): Promise<{ hash: string; url: string; name: string }> {
-  // Try direct URL upload first (Meta supports this natively for images)
   try {
     const response = await axios.post(
       `${GRAPH_API_BASE}/${adAccountId}/adimages`,
@@ -129,7 +128,6 @@ async function uploadAdImageFromUrl(
       name: firstKey || "uploaded_image",
     };
   } catch (directError: any) {
-    // If direct URL fails, download and re-upload as multipart
     const { buffer, fileName, mimeType } = await downloadFile(imageUrl);
 
     if (buffer.length > 30 * 1024 * 1024) {
@@ -289,7 +287,7 @@ async function listAdImages(adAccountId: string, limit: number = 25) {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "meta-ads-media",
-    version: "1.0.0",
+    version: "2.0.0",
   });
 
   // Tool: List Ad Accounts
@@ -368,7 +366,6 @@ function createMcpServer(): McpServer {
           return { content: [{ type: "text" as const, text: "Error: ad_account_id is required. Use list_ad_accounts to find available accounts." }] };
         }
 
-        // Strip data URI prefix if present
         const cleanBase64 = base64_data.replace(/^data:[^;]+;base64,/, "");
         const buffer = Buffer.from(cleanBase64, "base64");
 
@@ -635,68 +632,75 @@ function createMcpServer(): McpServer {
   return server;
 }
 
-// ─── Express + SSE Transport ─────────────────────────────────────────────────
+// ─── Express + Streamable HTTP Transport ────────────────────────────────────
 
 const app = express();
 app.use(cors());
 
-// IMPORTANT: Do NOT apply body parsers to /messages — the MCP SDK reads the raw stream itself.
-// Only apply JSON parser to other routes.
-app.use((req, res, next) => {
-  if (req.path === "/messages") {
-    return next();
-  }
-  express.json({ limit: "50mb" })(req, res, next);
-});
-
 // Health check endpoint
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "meta-ads-media-mcp", version: "1.0.0" });
+  res.json({ status: "ok", server: "meta-ads-media-mcp", version: "2.0.0", transport: "streamable-http" });
 });
 
-// Store active transports
-const transports: Map<string, SSEServerTransport> = new Map();
-
-// SSE endpoint - client connects here to establish the MCP session
-app.get("/sse", async (req, res) => {
-  // Optional auth check
-  if (AUTH_TOKEN) {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || authHeader !== `Bearer ${AUTH_TOKEN}`) {
-      res.status(401).json({ error: "Unauthorized" });
-      return;
+// MCP endpoint - Streamable HTTP (stateless mode)
+// Each POST creates a fresh server+transport, processes the request, then closes.
+// This avoids session management issues and works perfectly with Claude's custom connector.
+app.post("/mcp", async (req: Request, res: Response) => {
+  // Parse body manually to avoid stream consumption issues
+  let body: any;
+  try {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
-  }
-
-  const transport = new SSEServerTransport("/messages", res);
-  const sessionId = transport.sessionId;
-  transports.set(sessionId, transport);
-
-  const server = createMcpServer();
-
-  res.on("close", () => {
-    transports.delete(sessionId);
-  });
-
-  await server.connect(transport);
-});
-
-// Messages endpoint - client sends MCP messages here
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId as string;
-  const transport = transports.get(sessionId);
-
-  if (!transport) {
-    res.status(404).json({ error: "Session not found" });
+    body = JSON.parse(Buffer.concat(chunks).toString());
+  } catch (e) {
+    res.status(400).json({ jsonrpc: "2.0", error: { code: -32700, message: "Parse error" }, id: null });
     return;
   }
 
-  await transport.handlePostMessage(req, res);
+  const server = createMcpServer();
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
+  } catch (error) {
+    console.error("Error handling MCP request:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal server error" }, id: null });
+    }
+  }
+
+  res.on("close", () => {
+    transport.close();
+    server.close();
+  });
+});
+
+// GET /mcp - not supported in stateless mode
+app.get("/mcp", (_req: Request, res: Response) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. Use POST." }, id: null });
+});
+
+// DELETE /mcp - not supported in stateless mode
+app.delete("/mcp", (_req: Request, res: Response) => {
+  res.status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed." }, id: null });
+});
+
+// Also support /sse for backwards compatibility - redirect to info
+app.get("/sse", (_req, res) => {
+  res.status(410).json({
+    message: "This server now uses Streamable HTTP transport. Connect to POST /mcp instead.",
+    endpoint: "/mcp",
+    transport: "streamable-http",
+  });
 });
 
 // Start the server
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Meta Ads Media MCP Server running on port ${PORT}`);
-  console.log(`SSE endpoint: http://0.0.0.0:${PORT}/sse`);
+  console.log(`Meta Ads Media MCP Server v2.0.0 running on port ${PORT}`);
+  console.log(`Transport: Streamable HTTP (stateless)`);
+  console.log(`MCP endpoint: POST http://0.0.0.0:${PORT}/mcp`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
 });
