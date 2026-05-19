@@ -16,6 +16,34 @@ const GRAPH_API_VERSION = process.env.GRAPH_API_VERSION || "v25.0";
 const GRAPH_API_BASE = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
+// ─── Chunked Upload Session Storage ────────────────────────────────────────
+
+interface UploadSession {
+  id: string;
+  fileName: string;
+  mimeType: string;
+  adAccountId: string;
+  mediaType: "image" | "video";
+  chunks: string[];
+  totalChunks: number;
+  receivedChunks: number;
+  createdAt: number;
+  title?: string;
+  description?: string;
+}
+
+const uploadSessions = new Map<string, UploadSession>();
+
+// Clean up sessions older than 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of uploadSessions) {
+    if (now - session.createdAt > 10 * 60 * 1000) {
+      uploadSessions.delete(id);
+    }
+  }
+}, 60000);
+
 // ─── Helper Functions ────────────────────────────────────────────────────────
 
 async function downloadFile(url: string): Promise<{ buffer: Buffer; fileName: string; mimeType: string }> {
@@ -946,6 +974,195 @@ function createMcpServer(): McpServer {
               status: status || "PAUSED",
               message: `Ad created successfully. Ad ID: "${result.id}". ${status === "ACTIVE" ? "Ad is now delivering." : "Ad is paused — set status to ACTIVE when ready to launch."}`,
             }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Start Chunked Upload
+  server.tool(
+    "start_upload",
+    "Start a chunked file upload session. Use this when you have a large image or video to upload. Call this first, then send chunks via upload_chunk, then call finish_upload to push to Meta. Each chunk should be ~50KB of base64 (about 37KB decoded). This avoids timeout issues with large files.",
+    {
+      file_name: z
+        .string()
+        .describe("File name with extension (e.g., 'ad-creative.png', 'hero-video.mp4')"),
+      ad_account_id: z
+        .string()
+        .describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      total_chunks: z
+        .number()
+        .describe("Total number of chunks you will send. Calculate: Math.ceil(base64_string_length / 50000)"),
+      media_type: z
+        .enum(["image", "video"])
+        .describe("Whether this is an image or video upload."),
+      title: z
+        .string()
+        .optional()
+        .describe("Title for videos (optional, ignored for images)."),
+      description: z
+        .string()
+        .optional()
+        .describe("Description for videos (optional, ignored for images)."),
+    },
+    async ({ file_name, ad_account_id, total_chunks, media_type, title, description }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured on the server." }] };
+        }
+
+        const sessionId = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const mimeType = mimeFromExtension(file_name);
+
+        const session: UploadSession = {
+          id: sessionId,
+          fileName: file_name,
+          mimeType,
+          adAccountId: ad_account_id,
+          mediaType: media_type,
+          chunks: new Array(total_chunks).fill(""),
+          totalChunks: total_chunks,
+          receivedChunks: 0,
+          createdAt: Date.now(),
+          title,
+          description,
+        };
+
+        uploadSessions.set(sessionId, session);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              session_id: sessionId,
+              total_chunks,
+              chunk_size_guideline: "Send ~50000 characters of base64 per chunk",
+              message: `Upload session started. Now call upload_chunk ${total_chunks} times with chunk_index 0 through ${total_chunks - 1}, then call finish_upload.`,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: error.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Upload Chunk
+  server.tool(
+    "upload_chunk",
+    "Send one chunk of base64 data for a chunked upload session. Each chunk should be approximately 50000 characters of base64. Call this repeatedly for each chunk until all chunks are sent.",
+    {
+      session_id: z
+        .string()
+        .describe("The session ID returned from start_upload."),
+      chunk_index: z
+        .number()
+        .describe("Zero-based index of this chunk (0, 1, 2, ...)."),
+      data: z
+        .string()
+        .describe("A portion of the base64-encoded file data (~50000 characters). Do NOT include data:image/... prefix."),
+    },
+    async ({ session_id, chunk_index, data }) => {
+      try {
+        const session = uploadSessions.get(session_id);
+        if (!session) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Session not found or expired. Start a new upload with start_upload." }, null, 2) }] };
+        }
+
+        if (chunk_index < 0 || chunk_index >= session.totalChunks) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: `Invalid chunk_index. Must be 0 to ${session.totalChunks - 1}.` }, null, 2) }] };
+        }
+
+        session.chunks[chunk_index] = data;
+        session.receivedChunks++;
+
+        const remaining = session.totalChunks - session.receivedChunks;
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              session_id,
+              chunk_index,
+              chunks_received: session.receivedChunks,
+              chunks_remaining: remaining,
+              message: remaining === 0
+                ? "All chunks received! Call finish_upload to complete the upload to Meta."
+                : `Chunk ${chunk_index} received. ${remaining} chunks remaining.`,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: error.message }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Finish Upload
+  server.tool(
+    "finish_upload",
+    "Complete a chunked upload session. Assembles all chunks, decodes the base64, and uploads the file to Meta Ads Library. Call this after all chunks have been sent via upload_chunk.",
+    {
+      session_id: z
+        .string()
+        .describe("The session ID returned from start_upload."),
+    },
+    async ({ session_id }) => {
+      try {
+        const session = uploadSessions.get(session_id);
+        if (!session) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: "Session not found or expired." }, null, 2) }] };
+        }
+
+        // Check all chunks received
+        const missingChunks = session.chunks.map((c, i) => c === "" ? i : -1).filter(i => i >= 0);
+        if (missingChunks.length > 0) {
+          return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: `Missing chunks: ${missingChunks.join(", ")}. Send them via upload_chunk before finishing.` }, null, 2) }] };
+        }
+
+        // Assemble and decode
+        const fullBase64 = session.chunks.join("");
+        const buffer = Buffer.from(fullBase64, "base64");
+
+        let result: any;
+
+        if (session.mediaType === "image") {
+          const uploadResult = await uploadImageBuffer(buffer, session.fileName, session.mimeType, session.adAccountId);
+          result = {
+            success: true,
+            type: "image",
+            image_hash: uploadResult.hash,
+            image_url: uploadResult.url,
+            file_name: uploadResult.name,
+            ad_account_id: session.adAccountId,
+            message: `Image uploaded successfully! Image hash: "${uploadResult.hash}". Use this hash with create_ad_creative.`,
+          };
+        } else {
+          const uploadResult = await uploadVideoBuffer(buffer, session.fileName, session.mimeType, session.adAccountId, session.title, session.description);
+          result = {
+            success: true,
+            type: "video",
+            video_id: uploadResult.videoId,
+            title: uploadResult.title,
+            upload_status: uploadResult.uploadStatus,
+            ad_account_id: session.adAccountId,
+            message: `Video uploaded successfully! Video ID: "${uploadResult.videoId}". Use check_video_status to verify processing is complete.`,
+          };
+        }
+
+        // Clean up session
+        uploadSessions.delete(session_id);
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
           }],
         };
       } catch (error: any) {
