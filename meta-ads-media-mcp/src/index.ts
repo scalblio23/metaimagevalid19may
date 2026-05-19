@@ -407,7 +407,7 @@ async function getAdCreativeDetails(creativeId: string) {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "meta-ads-media",
-    version: "2.0.0",
+    version: "3.0.0",
   });
 
   // Tool: List Ad Accounts
@@ -868,6 +868,231 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ─── INSIGHTS / METRICS TOOLS ─────────────────────────────────────────────
+
+  // Tool: Get Account Insights
+  server.tool(
+    "get_account_insights",
+    "Get overall performance metrics for a Meta Ad Account. Returns spend, impressions, clicks, CTR, CPC, CPM, reach, frequency, conversions, and ROAS.",
+    {
+      ad_account_id: z.string().describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      date_preset: z.string().optional().describe("Predefined date range. Options: today, yesterday, this_month, last_month, this_quarter, last_3d, last_7d, last_14d, last_28d, last_30d, last_90d, last_week_mon_sun, last_week_sun_sat, last_quarter, last_year, this_week_mon_today, this_week_sun_today, this_year. Default: last_7d"),
+      since: z.string().optional().describe("Custom start date (YYYY-MM-DD). Use with 'until' for custom range. Overrides date_preset."),
+      until: z.string().optional().describe("Custom end date (YYYY-MM-DD). Use with 'since' for custom range."),
+      breakdown: z.string().optional().describe("Optional breakdown: age, gender, country, region, dma, impression_device, platform_position, publisher_platform"),
+    },
+    async ({ ad_account_id, date_preset, since, until, breakdown }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured." }] };
+        }
+        const params: any = {
+          fields: "account_name,spend,impressions,clicks,ctr,cpc,cpm,cpp,reach,frequency,actions,cost_per_action_type,conversions,cost_per_conversion,purchase_roas",
+          access_token: META_ACCESS_TOKEN,
+          level: "account",
+        };
+        if (since && until) {
+          params.time_range = JSON.stringify({ since, until });
+        } else {
+          params.date_preset = date_preset || "last_7d";
+        }
+        if (breakdown) params.breakdowns = breakdown;
+
+        const response = await axios.get(`${GRAPH_API_BASE}/${ad_account_id}/insights`, { params });
+        const insights = response.data.data || [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              level: "account",
+              ad_account_id,
+              date_range: (since && until) ? `${since} to ${until}` : (date_preset || "last_7d"),
+              breakdown: breakdown || "none",
+              insights,
+              count: insights.length,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Get Campaign Insights
+  server.tool(
+    "get_campaign_insights",
+    "Get performance metrics broken down by campaign. Returns spend, impressions, clicks, CTR, CPC, CPM, reach, conversions, and ROAS per campaign.",
+    {
+      ad_account_id: z.string().describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      campaign_id: z.string().optional().describe("Optional specific campaign ID. If omitted, returns insights for all campaigns."),
+      date_preset: z.string().optional().describe("Predefined date range (e.g., last_7d, last_30d, this_month, yesterday). Default: last_7d"),
+      since: z.string().optional().describe("Custom start date (YYYY-MM-DD). Use with 'until'. Overrides date_preset."),
+      until: z.string().optional().describe("Custom end date (YYYY-MM-DD). Use with 'since'."),
+      limit: z.number().optional().describe("Max results to return (default 25)"),
+    },
+    async ({ ad_account_id, campaign_id, date_preset, since, until, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured." }] };
+        }
+        const endpoint = campaign_id
+          ? `${GRAPH_API_BASE}/${campaign_id}/insights`
+          : `${GRAPH_API_BASE}/${ad_account_id}/insights`;
+
+        const params: any = {
+          fields: "campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type,conversions,cost_per_conversion,purchase_roas",
+          access_token: META_ACCESS_TOKEN,
+          limit: limit || 25,
+        };
+        if (!campaign_id) params.level = "campaign";
+        if (since && until) {
+          params.time_range = JSON.stringify({ since, until });
+        } else {
+          params.date_preset = date_preset || "last_7d";
+        }
+
+        const response = await axios.get(endpoint, { params });
+        const insights = response.data.data || [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              level: "campaign",
+              ad_account_id,
+              campaign_id: campaign_id || "all",
+              date_range: (since && until) ? `${since} to ${until}` : (date_preset || "last_7d"),
+              insights,
+              count: insights.length,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Get Ad Set Insights
+  server.tool(
+    "get_adset_insights",
+    "Get performance metrics broken down by ad set. Returns spend, impressions, clicks, CTR, CPC, CPM, reach, conversions, and ROAS per ad set.",
+    {
+      ad_account_id: z.string().describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      adset_id: z.string().optional().describe("Optional specific ad set ID. If omitted, returns insights for all ad sets."),
+      date_preset: z.string().optional().describe("Predefined date range (e.g., last_7d, last_30d, this_month). Default: last_7d"),
+      since: z.string().optional().describe("Custom start date (YYYY-MM-DD). Use with 'until'. Overrides date_preset."),
+      until: z.string().optional().describe("Custom end date (YYYY-MM-DD). Use with 'since'."),
+      limit: z.number().optional().describe("Max results to return (default 25)"),
+    },
+    async ({ ad_account_id, adset_id, date_preset, since, until, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured." }] };
+        }
+        const endpoint = adset_id
+          ? `${GRAPH_API_BASE}/${adset_id}/insights`
+          : `${GRAPH_API_BASE}/${ad_account_id}/insights`;
+
+        const params: any = {
+          fields: "adset_id,adset_name,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type,conversions,cost_per_conversion,purchase_roas",
+          access_token: META_ACCESS_TOKEN,
+          limit: limit || 25,
+        };
+        if (!adset_id) params.level = "adset";
+        if (since && until) {
+          params.time_range = JSON.stringify({ since, until });
+        } else {
+          params.date_preset = date_preset || "last_7d";
+        }
+
+        const response = await axios.get(endpoint, { params });
+        const insights = response.data.data || [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              level: "adset",
+              ad_account_id,
+              adset_id: adset_id || "all",
+              date_range: (since && until) ? `${since} to ${until}` : (date_preset || "last_7d"),
+              insights,
+              count: insights.length,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
+  // Tool: Get Ad Insights
+  server.tool(
+    "get_ad_insights",
+    "Get performance metrics broken down by individual ad. Returns spend, impressions, clicks, CTR, CPC, CPM, reach, conversions, and ROAS per ad.",
+    {
+      ad_account_id: z.string().describe("Meta Ad Account ID (format: act_XXXXXXXXX)."),
+      ad_id: z.string().optional().describe("Optional specific ad ID. If omitted, returns insights for all ads."),
+      date_preset: z.string().optional().describe("Predefined date range (e.g., last_7d, last_30d, this_month). Default: last_7d"),
+      since: z.string().optional().describe("Custom start date (YYYY-MM-DD). Use with 'until'. Overrides date_preset."),
+      until: z.string().optional().describe("Custom end date (YYYY-MM-DD). Use with 'since'."),
+      limit: z.number().optional().describe("Max results to return (default 25)"),
+    },
+    async ({ ad_account_id, ad_id, date_preset, since, until, limit }) => {
+      try {
+        if (!META_ACCESS_TOKEN) {
+          return { content: [{ type: "text" as const, text: "Error: META_ACCESS_TOKEN is not configured." }] };
+        }
+        const endpoint = ad_id
+          ? `${GRAPH_API_BASE}/${ad_id}/insights`
+          : `${GRAPH_API_BASE}/${ad_account_id}/insights`;
+
+        const params: any = {
+          fields: "ad_id,ad_name,adset_name,campaign_name,spend,impressions,clicks,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type,conversions,cost_per_conversion,purchase_roas",
+          access_token: META_ACCESS_TOKEN,
+          limit: limit || 25,
+        };
+        if (!ad_id) params.level = "ad";
+        if (since && until) {
+          params.time_range = JSON.stringify({ since, until });
+        } else {
+          params.date_preset = date_preset || "last_7d";
+        }
+
+        const response = await axios.get(endpoint, { params });
+        const insights = response.data.data || [];
+
+        return {
+          content: [{
+            type: "text" as const,
+            text: JSON.stringify({
+              success: true,
+              level: "ad",
+              ad_account_id,
+              ad_id: ad_id || "all",
+              date_range: (since && until) ? `${since} to ${until}` : (date_preset || "last_7d"),
+              insights,
+              count: insights.length,
+            }, null, 2),
+          }],
+        };
+      } catch (error: any) {
+        const errorMsg = error.response?.data?.error?.message || error.message || "Unknown error";
+        return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: errorMsg }, null, 2) }] };
+      }
+    }
+  );
+
   // Tool: Get Upload URL
   server.tool(
     "get_upload_url",
@@ -986,7 +1211,7 @@ app.use(cors());
 
 // Health check endpoint
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", server: "meta-ads-media-mcp", version: "2.0.0", transport: "streamable-http" });
+  res.json({ status: "ok", server: "meta-ads-media-mcp", version: "3.0.0", transport: "streamable-http" });
 });
 
 // MCP endpoint - Streamable HTTP (stateless mode)
@@ -1108,8 +1333,9 @@ app.post("/upload/:sessionId", upload.single("file"), async (req: Request, res: 
 
 // Start the server
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Meta Ads Media MCP Server v2.0.0 running on port ${PORT}`);
+  console.log(`Meta Ads Media MCP Server v3.0.0 running on port ${PORT}`);
   console.log(`Transport: Streamable HTTP (stateless)`);
   console.log(`MCP endpoint: POST http://0.0.0.0:${PORT}/mcp`);
   console.log(`Health check: http://0.0.0.0:${PORT}/health`);
+  console.log(`Tools: 17 (including 4 insights/metrics tools)`);
 });
